@@ -26,8 +26,9 @@ var (
 	// ErrInvalidContentType ...
 	ErrInvalidContentType = errors.New("invalid content type")
 	// RespOK ...
-	RespOK = []byte("OK")
-	db     *bolt.DB
+	RespOK       = []byte("OK")
+	db           *bolt.DB
+	buildVersion string
 )
 
 const (
@@ -78,6 +79,7 @@ func init() {
 		TimestampFormat: "2006-01-02 15:04:05",
 	})
 	logrus.SetLevel(formatLogLevel(*logLevel))
+	logrus.WithField("buildVersion", buildVersion).Info("build info")
 }
 
 func main() {
