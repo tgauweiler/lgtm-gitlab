@@ -6,36 +6,50 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"os"
+
+	"strconv"
+
+	"github.com/Sirupsen/logrus"
+	"github.com/boltdb/bolt"
 )
 
-func init() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-}
-
 var (
-	privateToken = flag.String("private_token", "", "gitlab private token which used to accept merge request. can be found in https://your.gitlab.com/profile/account")
-	gitlabURL    = flag.String("gitlab_url", "", "e.g. https://your.gitlab.com")
+	// ErrInvalidRequest ...
+	ErrInvalidRequest = errors.New("invalid request body")
+	// ErrInvalidContentType ...
+	ErrInvalidContentType = errors.New("invalid content type")
+	// RespOK ...
+	RespOK = []byte("OK")
+	db     *bolt.DB
 )
 
 const (
-	ValidLGTMCount = 2 // 满足条件的LGTM 数量
+	// ObjectNote ...
+	ObjectNote = "note"
+	// NoteableTypeMergeRequest ...
+	NoteableTypeMergeRequest = "MergeRequest"
+	// NoteLGTM ...
+	NoteLGTM = "LGTM"
+	// StatusCanbeMerged ...
+	StatusCanbeMerged = "can_be_merged"
+	bucketName        = "lgtm"
 )
 
 var (
-	ErrInvalidRequest     = errors.New("invalid request body")
-	ErrInvalidContentType = errors.New("invalid content type")
-	RespOK                = []byte("OK")
-
-	ObjectNote               = "note"
-	NoteableTypeMergeRequest = "MergeRequest"
-	NoteLGTM                 = "LGTM"
-	StatusCanbeMerged        = "can_be_merged"
+	privateToken   = flag.String("token", "", "gitlab private token which used to accept merge request. can be found in https://your.gitlab.com/profile/account")
+	gitlabURL      = flag.String("gitlab_url", "", "e.g. https://your.gitlab.com")
+	validLGTMCount = flag.Int("lgtm_count", 2, "lgtm user count")
+	lgtmNote       = flag.String("lgtm_note", NoteLGTM, "lgtm note")
+	logLevel       = flag.String("log_level", "info", "log level")
+	port           = flag.Int("port", 8989, "http listen port")
+	dbPath         = flag.String("db_path", "lgtm.data", "bolt db data")
 )
 
 var (
@@ -46,24 +60,45 @@ var (
 	glURL *url.URL
 )
 
-func main() {
-	flag.Parse()
+func formatLogLevel(level string) logrus.Level {
+	l, err := logrus.ParseLevel(string(level))
+	if err != nil {
+		l = logrus.InfoLevel
+		logrus.Warnf("error parsing level %q: %v, using %q	", level, err, l)
+	}
 
+	return l
+}
+
+func init() {
+	flag.Parse()
+	logrus.SetOutput(os.Stderr)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
+	logrus.SetLevel(formatLogLevel(*logLevel))
+}
+
+func main() {
 	if *privateToken == "" {
-		fmt.Println("private token is required")
-		return
+		logrus.Fatal("private token is required")
 	}
 	if *gitlabURL == "" {
-		fmt.Println("gitlab url is required")
-		return
+		logrus.Fatal("gitlab url is required")
 	}
-
+	var err error
+	db, err = bolt.Open(*dbPath, 0600, nil)
+	if err != nil {
+		logrus.WithError(err).Fatal("open local db failed")
+	}
+	defer db.Close()
 	parseURL(*gitlabURL)
 
-	fmt.Println("start http server")
-	http.HandleFunc("/gitlab/hook", LGTM)
+	http.HandleFunc("/gitlab/hook", LGTMHandler)
 	go func() {
-		http.ListenAndServe(":8989", nil)
+		logrus.Infof("Webhook server listen on 0.0.0.0:%d", *port)
+		http.ListenAndServe(":"+strconv.Itoa(*port), nil)
 	}()
 
 	<-(chan struct{})(nil)
@@ -77,14 +112,17 @@ func parseURL(urlStr string) {
 	}
 }
 
-func LGTM(w http.ResponseWriter, r *http.Request) {
-	log.Printf("method:%s, remote_addr:%s, form:%+v, header:%+v", r.Method, r.RemoteAddr, r.Form, r.Header)
-
+// LGTMHandler ...
+func LGTMHandler(w http.ResponseWriter, r *http.Request) {
+	logrus.WithFields(logrus.Fields{
+		"method":      r.Method,
+		"remote_addr": r.RemoteAddr,
+	}).Infoln("access")
 	var errRet error
 	defer func() {
 		if errRet != nil {
 			errMsg := fmt.Sprintf("error occurs:%s", errRet.Error())
-			log.Println(errMsg)
+			logrus.WithError(errRet).Errorln("error response")
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprintf(w, errMsg)
 			return
@@ -94,6 +132,10 @@ func LGTM(w http.ResponseWriter, r *http.Request) {
 
 	if r.Header.Get("Content-Type") != "application/json" {
 		errRet = ErrInvalidContentType
+		return
+	}
+	if r.Method != "POST" {
+		errRet = ErrInvalidRequest
 		return
 	}
 	if r.Body == nil {
@@ -107,11 +149,10 @@ func LGTM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	checkLgtm(comment)
+	go checkLgtm(comment)
 }
 
 func checkLgtm(comment Comment) error {
-	log.Printf("debug comment:%+v", comment)
 	if comment.ObjectKind != ObjectNote {
 		// unmatched, do nothing
 		return nil
@@ -122,51 +163,98 @@ func checkLgtm(comment Comment) error {
 		return nil
 	}
 
-	if strings.ToUpper(comment.ObjectAttributes.Note) != NoteLGTM {
+	if strings.ToUpper(comment.ObjectAttributes.Note) != *lgtmNote {
 		// unmatched, do nothing
 		return nil
 	}
 
 	// TODO: 检查评论LGTM的两个人 是不同的人
+	var (
+		canbeMerged bool
+		err         error
+	)
+	logrus.WithFields(logrus.Fields{
+		"user": comment.User.Username,
+		"note": comment.ObjectAttributes.Note,
+		"MR":   comment.MergeRequest.ID,
+	}).Info("comment")
 
-	var canbeMerged bool
+	canbeMerged, err = checkLGTMCount(comment)
 
-	mutex.Lock()
-	if count, ok := lgtmCount[comment.MergeRequest.ID]; ok {
-		newCount := count + 1
-		if newCount >= ValidLGTMCount {
-			canbeMerged = true
-		}
-		lgtmCount[comment.MergeRequest.ID] = newCount
-	} else {
-		lgtmCount[comment.MergeRequest.ID] = 1
+	if err != nil {
+		logrus.WithError(err).Errorln("check LGTM count failed")
+		return nil
 	}
-	mutex.Unlock()
-
-	log.Printf("counter: %+v", lgtmCount)
-
 	if canbeMerged && comment.MergeRequest.MergeStatus == StatusCanbeMerged {
-		log.Printf("The MR can be merged. ")
+		logrus.WithField("MR", comment.MergeRequest.ID).Info("The MR can be merged.")
 		acceptMergeRequest(comment.ProjectID, comment.MergeRequest.ID, comment.MergeRequest.MergeParams.ForceRemoveSourceBranch)
+	} else {
+		logrus.WithFields(logrus.Fields{
+			"MR":          comment.MergeRequest.ID,
+			"canbeMerged": canbeMerged,
+			"MergeStatus": comment.MergeRequest.MergeStatus,
+		}).Info("The MR can not be merged.")
+
 	}
 
 	return nil
 }
 
-func acceptMergeRequest(projectID int, mergeRequestID int, shouldRemoveSourceBranch bool) {
+func checkLGTMCount(comment Comment) (bool, error) {
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	tx, err := db.Begin(true)
+	if err != nil {
+		return false, err
+	}
+	bucket, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+	if err != nil {
+		return false, err
+	}
+	count := 0
+	countKey := []byte(strconv.Itoa(comment.MergeRequest.ID))
+	countByte := bucket.Get(countKey)
+	if len(countByte) > 0 {
+		count, err = strconv.Atoi(string(countByte))
+		if err != nil {
+			logrus.WithField("value", string(countByte)).Warnln("wrong count")
+			count = 0
+			err = nil
+		}
+	}
+
+	count++
+
+	if err := bucket.Put(countKey, []byte(strconv.Itoa(count))); err != nil {
+		return false, err
+	}
+	checkStatus := count%(*validLGTMCount) == 0
+
+	if err := tx.Commit(); err != nil {
+		return checkStatus, err
+	}
+	logrus.WithFields(logrus.Fields{
+		"count": count,
+		"MR":    comment.MergeRequest.ID,
+	}).Info("MR count")
+	return checkStatus, nil
+}
+
+func acceptMergeRequest(projectID int, mergeRequestID int, shouldRemoveSourceBranch string) {
 	params := map[string]string{
-		"should_remove_source_branch": "true",
+		"should_remove_source_branch": shouldRemoveSourceBranch,
 	}
 	bodyBytes, err := json.Marshal(params)
 	if err != nil {
-		log.Printf("json marshal error:%s", err.Error())
+		logrus.WithError(err).Errorln("json marshal failed")
 		return
 	}
 
 	glURL.Path = fmt.Sprintf("/api/v3/projects/%d/merge_requests/%d/merge", projectID, mergeRequestID)
 	req, err := http.NewRequest("PUT", glURL.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
-		log.Printf("http NewRequest error:%s", err.Error())
+		logrus.WithError(err).Errorln("http NewRequest failed")
 		return
 	}
 	req.Header.Set("Conntent-Type", "application/json")
@@ -175,20 +263,25 @@ func acceptMergeRequest(projectID int, mergeRequestID int, shouldRemoveSourceBra
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("execute request error:%s", err.Error())
+		logrus.WithError(err).Errorln("execute request failed")
 		return
 	}
 
 	switch resp.StatusCode {
 	// 200
 	case http.StatusOK:
-		log.Printf("accept merge request successfully.")
+		logrus.Info("accept merge request successfully")
 	// 405
 	case http.StatusMethodNotAllowed:
-		log.Printf("it has some conflicts and can not be merged")
+		logrus.Warnln("it has some conflicts and can not be merged")
 	// 406
 	case http.StatusNotAcceptable:
-		log.Printf("merge request is already merged or closed")
+		logrus.Warnln("merge request is already merged or closed")
+	default:
+		logrus.WithFields(logrus.Fields{
+			"http_code":   resp.StatusCode,
+			"http_status": resp.Status,
+		}).Errorln("accept merge failed")
 	}
 }
 
@@ -268,7 +361,7 @@ type Comment struct {
 		UpdatedByID     interface{} `json:"updated_by_id"`
 		MergeError      interface{} `json:"merge_error"`
 		MergeParams     struct {
-			ForceRemoveSourceBranch bool `json:"force_remove_source_branch"`
+			ForceRemoveSourceBranch string `json:"force_remove_source_branch"`
 		} `json:"merge_params"`
 		MergeWhenBuildSucceeds   bool        `json:"merge_when_build_succeeds"`
 		MergeUserID              interface{} `json:"merge_user_id"`
