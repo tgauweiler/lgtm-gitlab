@@ -1,5 +1,5 @@
 FROM alpine:latest
-MAINTAINER tgauweiler
+LABEL maintainer="43210663+tgauweiler@users.noreply.github.com"
 
 RUN apk add --no-cache --update ca-certificates
 
