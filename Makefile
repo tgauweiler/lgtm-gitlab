@@ -10,6 +10,9 @@ lgtm:
 	echo "Building lgtm $(LDFLAGS)"
 	go install -ldflags "$(LDFLAGS)"
 
+alpine:
+	GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -a -tags netgo -installsuffix netgo -o lgtm
+
 dist-clean:
 	rm -rf dist
 	rm -f lgtm-*.tar.gz
