@@ -9,13 +9,11 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"os"
-
-	"strconv"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/boltdb/bolt"
@@ -296,7 +294,7 @@ func acceptMergeRequest(projectID int, mergeRequestIID int, shouldRemoveSourceBr
 		return
 	}
 
-	glURL.Path = fmt.Sprintf("/api/v4/projects/%d/merge_requests/%d/merge", projectID, mergeRequestIID)
+	glURL.Path = glURL.Path + fmt.Sprintf("/api/v4/projects/%d/merge_requests/%d/merge", projectID, mergeRequestIID)
 	req, err := http.NewRequest("PUT", glURL.String(), bytes.NewReader(bodyBytes))
 	if err != nil {
 		logrus.WithError(err).Errorln("http NewRequest failed")
