@@ -1,8 +1,8 @@
 .SILENT :
 .PHONY : lgtm clean fmt
 
-TAG:=`git describe --abbrev=0 --tags`
-LDFLAGS:=-X main.buildVersion=$(TAG)
+HASH:=`git rev-parse --short HEAD`
+LDFLAGS:=-X main.buildVersion=$(HASH)
 
 all: lgtm
 
