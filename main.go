@@ -50,6 +50,7 @@ var (
 	lgtmNote       = flag.String("lgtm_note", NoteLGTM, "lgtm note")
 	logLevel       = flag.String("log_level", "info", "log level")
 	port           = flag.Int("port", 8989, "http listen port")
+	webhook        = flag.String("webhook_path", "/gitlab/hook", "gitlab webhook path")
 	dbPath         = flag.String("db_path", "lgtm.data", "bolt db data")
 )
 
@@ -118,9 +119,9 @@ func main() {
 	defer db.Close()
 	parseURL(*gitlabURL)
 
-	http.HandleFunc("/gitlab/hook", LGTMHandler)
+	http.HandleFunc(*webhook, LGTMHandler)
 	go func() {
-		logrus.Infof("Webhook server listen on 0.0.0.0:%d", *port)
+		logrus.Infof("Webhook server listen on 0.0.0.0:%d%s", *port, *webhook)
 		http.ListenAndServe(":"+strconv.Itoa(*port), nil)
 	}()
 
